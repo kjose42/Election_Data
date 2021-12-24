@@ -1,8 +1,8 @@
 NOTE:
 -----
 I could not upload penna and votes table to Github because the files were greater than 25 MB. 
-However, I am willing to email the files if you are interested. Just contact me through my email 
-and I will send the files by email. Sorry for the inconvenience!
+However, I am willing to email the files if you are interested. Just contact me through my 
+email and I will send the files by email. Sorry for the inconvenience!
 
 
 Background Information:
