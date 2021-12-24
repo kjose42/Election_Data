@@ -28,3 +28,8 @@ BidenGraph file and TrumpGraph file are for PlotCandidate
 Penna file is the adjusted penna table
 
 votes file and precincts file are the tables for decomposed Penna
+
+
+NOTE:
+-----
+I could not upload penna and votes table to Github because the files were greater than 25 MB. However, I am willing to email the files if you are interested. Just contact me through my email and I will send the files by email. Sorry for the inconvenience!
