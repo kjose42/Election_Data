@@ -1,0 +1,755 @@
+
+Functional dependencies for Penna:
+
+precinct -> state, locality, geo
+precinct, timestamp -> ID, totalvotes, Biden, Trump, filestamp
+
+
+==============================================================================================
+==============================================================================================
+
+
+Penna is not in BCNF because a function dependency violates BCNF.
+
+Penna is then decomposed into two tables: Precincts and Votes.
+
+DECOMPOSITION TABLES AND QUERIES TO POPULATE:
+-----------------------------------------------------
+
+CREATE TABLE Precincts(
+	precinct	VARCHAR(255) PRIMARY KEY,
+	state	VARCHAR(255),
+	locality	VARCHAR(255),
+	geo	VARCHAR(255));
+
+INSERT INTO precincts(
+	SELECT distinct precinct, state, locality, geo
+	FROM penna);
+
+CREATE TABLE Votes(
+	ID	REAL,
+	Timestamp	VARCHAR(255),
+	precinct	VARCHAR(255) REFERENCES precincts(precinct),
+	totalvotes	REAL,
+	Biden	REAL,
+	Trump	REAL,
+	filestamp	VARCHAR(255));
+
+INSERT INTO votes(Timestamp, precinct, ID, totalvotes, Biden, Trump, filestamp) 
+SELECT Timestamp, precinct, ID, totalvotes, Biden, Trump, filestamp
+FROM penna;
+
+
+==============================================================================================
+==============================================================================================
+
+
+QUERY THAT FINDS SUSPICIOUS DATA:
+---------------------------------
+
+SELECT distinct timestamp, count(precinct) as countPrecinct, min(ID) as firstID, 
+	max(ID) as lastID, max(ID) - min(ID) + 1 as IDtotal
+FROM votes
+GROUP BY timestamp
+HAVING count(precinct) < IDtotal
+ORDER BY timestamp ASC;
+
+Result:
+timestamp   countPrecinct   firstID   lastID   IDtotal
+-------------------------------------------------------
+(returns 170 tuples)
+
+countPrecinct represents the total number of precincts that have a tuple at a certain 
+timestamp.
+firstID represents the lowest ID number. For all Timestamps, firstID = 0. 
+lastId represents the highest ID number. 
+IDtotal represents expected number of IDs. This is because ID numbers increment by 1.
+Thus, IDtotal is calculated from the difference of firstID and lastID. The difference is added
+by 1 to include a 0 ID.
+
+The table shows that a different set of IDs are assigned to precincts at different periods of 
+the election. For example, between timestamps '2020-11-03 19:39:48' and '2020-11-04 01:37:59',
+the ID number ranges from 0 - 679. Between timestamps '2020-11-04 01:41:00' and
+'2020-11-04 02:33:08', the ID number ranges from 0-493.
+
+Since each precinct is given an ID, the number of expected IDs (IDtotal) should equal to the
+number of precincts (countPrecinct).
+
+However, penna does not always meet this expectation. The query shows the timestamps where the
+number of precincts (countPrecinct) is less than the number of expected IDs (IDtotal). This 
+means that one or more precinct was given an ID number, but is missing at that timestamp.
+
+
+==============================================================================================
+==============================================================================================
+
+
+PROCEDURES FOR API CALLS:
+-------------------------
+
+ - Procedure 1 -
+Shows who won a precinct (input), the percentage of total votes that went to the candidate, 
+and the total votes in the precinct.
+
+DELIMITER //
+CREATE PROCEDURE Winner(IN input VARCHAR(255))
+BEGIN
+SELECT 'Biden' as candidate, (Biden/totalvotes)*100 as percentage, totalvotes
+FROM votes
+WHERE Timestamp = '2020-11-11 21:50:46' and precinct = input and Biden > Trump
+UNION
+SELECT 'Trump' as candidate, (Trump/totalvotes)*100 as percentage, totalvotes
+FROM votes
+WHERE Timestamp = '2020-11-11 21:50:46' and precinct = input and Biden < Trump;
+END//
+DELIMITER ;
+
+
+ - Procedure 2 - 
+Gives a numerical rank to a precinct (input). This rank is in terms of the amount of votes it 
+received (at the last timestamp) compared to all the precincts in the database.
+
+DELIMITER //
+CREATE PROCEDURE RankALL(IN input VARCHAR(255))
+BEGIN
+DROP TABLE if exists precinct_total;
+CREATE TABLE precinct_total as (SELECT precinct, totalvotes
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46');
+SELECT count(p2.precinct) + 1 as rank_number
+FROM precinct_total p1, precinct_total p2
+WHERE p1.precinct = input and p2.precinct != input and p2.totalvotes > p1.totalvotes;
+END //
+DELIMITER ;
+
+
+ - Procedure 3 - 
+Gives a numerical rank to a precinct (input). This rank is in terms of the amount of votes it 
+received (at the last timestamp) compared to all the precincts in input's county.
+
+DELIMITER //
+CREATE PROCEDURE RankCounty(IN input VARCHAR(255))
+BEGIN
+DROP TABLE if exists precinct_total;
+CREATE TABLE precinct_total as (SELECT precinct, totalvotes
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46');
+SELECT count(t2.precinct) + 1 as rank_number
+FROM precinct_total t1, precinct_total t2, precincts p1, precincts p2
+WHERE t1.precinct = input and t2.precinct != input
+	and t2.totalvotes > t1.totalvotes and t1.precinct = p1.precinct
+	and t2.precinct = p2.precinct and p1.locality = p2.locality;
+END //
+DELIMITER ;
+
+
+ - Procedure 4 - 
+Shows tuples of Timestamp, totalvotes, Trump, and Biden for a precinct (input). The output of 
+this procedure is used for a time series graph (see PlotPrecinctGraph file). For the graph, 
+Timestamp is on the x-axis and votes is on the y-axis. There are three lines: one for 
+totalvotes votes, one for Trump votes, and one for Biden votes.
+
+DELIMITER //
+CREATE PROCEDURE PlotPrecinct(IN input VARCHAR(255))
+BEGIN
+SELECT Timestamp, totalvotes, Trump, Biden
+FROM votes
+WHERE precinct = input
+GROUP BY Timestamp
+ORDER BY Timestamp ASC;
+END//
+DELIMITER ;
+
+
+ - Procedure 5 - 
+Shows the first precinct to reach a certain number of votes (vote_count) and shows when the 
+precinct reached vote_count. If multiple precincts have reached vote_count at the same 
+timestamp, the precinct with the highest totalvotes is shown.
+
+DELIMITER //
+CREATE PROCEDURE EarliestPrecinct(IN vote_count INT)
+BEGIN
+SELECT votes.precinct, votes.Timestamp
+FROM votes, (SELECT Timestamp, max(totalvotes) as max_votes
+	FROM votes
+	WHERE Timestamp = (SELECT min(Timestamp)
+		FROM(SELECT Timestamp
+			FROM votes
+			WHERE totalvotes >= vote_count
+			GROUP BY Timestamp)t))t2
+WHERE votes.Timestamp = t2.Timestamp and votes.totalvotes = max_votes;
+END//
+DELIMITER ;
+
+
+
+ - Procedure 6 - 
+Shows the precincts which the candidate won, the amount of votes that the candidate received, 
+and the vote difference between the two candidates. The table is ordered by vote difference.
+
+DELIMITER //
+CREATE PROCEDURE PrecinctsWon(IN candidate VARCHAR(255))
+BEGIN
+IF(candidate = 'Biden')
+THEN
+	SELECT precinct, Biden-Trump as difference, Biden as total
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46' and Biden > Trump
+	ORDER BY Biden-Trump DESC;
+END IF;
+IF(candidate = 'Trump')
+THEN
+	SELECT precinct, Trump-Biden as difference, Trump as total
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46' and Trump > Biden
+	ORDER BY Trump-Biden DESC;
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 7 - 
+Shows the amount of precincts which the candidate won.
+
+DELIMITER //
+CREATE PROCEDURE PrecinctsWonCount(IN candidate VARCHAR(255))
+BEGIN
+IF(candidate = 'Biden')
+THEN
+	SELECT COUNT(precinct)
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46' and Biden > Trump;
+END IF;
+IF(candidate = 'Trump')
+THEN
+	SELECT COUNT(precinct)
+	FROM votes
+	WHERE Timestamp = '2020-11-11 21:50:46' and Trump > Biden;
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 8 - 
+Shows precincts which the candidate had a lead in at every timestamp.
+
+DELIMITER //
+CREATE PROCEDURE PrecinctsFullLead(IN candidate VARCHAR(255))
+BEGIN
+IF(candidate = 'Biden')
+THEN
+	SELECT distinct v1.precinct
+	FROM votes v1
+	WHERE NOT EXISTS (SELECT Timestamp
+		FROM votes v2
+		WHERE v2.precinct = v1.precinct and Biden < Trump);
+END IF;
+IF(candidate = 'Trump')
+THEN
+	SELECT distinct v1.precinct
+	FROM votes v1
+	WHERE NOT EXISTS (SELECT Timestamp
+		FROM votes v2
+		WHERE v2.precinct = v1.precinct and Biden > Trump);
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 9 - 
+Shows tuples of Timestamp and votes for the candidate. The output of this procedure is used 
+for two time series graphs. One for Biden (see BidenGraph file) and one for Trump (see 
+TrumpGraph file).
+
+DELIMITER //
+CREATE PROCEDURE PlotCandidate(IN candidate VARCHAR(255))
+BEGIN
+IF(candidate = 'Biden')
+THEN
+	SELECT Timestamp, sum(Biden) as Biden_votes
+	FROM votes
+	GROUP BY Timestamp
+	ORDER BY Timestamp ASC;
+END IF;
+IF(candidate = 'Trump')
+THEN
+	SELECT Timestamp, sum(Trump) as Trump_votes
+	FROM votes
+	GROUP BY Timestamp
+	ORDER BY Timestamp ASC;
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 10 - 
+Shows which candidate won Township precincts, the vote difference between the two candidates,
+and the amount of votes each candidate recieved from all Township precincts.
+
+DELIMITER //
+CREATE PROCEDURE PrecinctsWonTownships()
+BEGIN
+SELECT 'Biden' as candidate, sum(max_Biden) - sum(max_Trump) as difference, sum(max_Biden), 
+	sum(max_Trump)
+FROM(SELECT precinct, max(Biden) as max_Biden, max(Trump) as max_Trump
+	FROM Penna
+	GROUP BY precinct
+	HAVING precinct LIKE '%Township%')t
+HAVING sum(max_Biden) > sum(max_Trump)
+UNION
+SELECT 'Trump' as candidate, sum(max_Trump) - sum(max_Biden) as difference, sum(max_Biden), 
+	sum(max_Trump)
+FROM(SELECT precinct, max(Biden) as max_Biden, max(Trump) as max_Trump
+	FROM Penna
+	GROUP BY precinct
+	HAVING precinct LIKE '%Township%')t
+HAVING sum(max_Biden) < sum(max_Trump);
+END//
+DELIMITER ;
+
+
+
+ - Procedure 11 - 
+Valid categories: "ALL", "Trump", "Biden". This procedure shows lists of precincts ordered by 
+totalvotes (if category = "ALL"), Biden (if category = "Biden"), or Trump 
+(if category = "Trump").
+
+DELIMITER //
+CREATE PROCEDURE TotalVotes(IN timeIN VARCHAR(255), IN category VARCHAR(255))
+BEGIN
+IF(category = 'Biden')
+THEN
+	SELECT precinct
+	FROM votes
+	WHERE Timestamp = timeIN
+	ORDER BY Biden DESC;
+END IF;
+IF(category = 'Trump')
+THEN
+	SELECT precinct
+	FROM votes
+	WHERE Timestamp = timeIN
+	ORDER BY Trump DESC;
+END IF;
+IF(category = 'ALL')
+THEN
+	SELECT precinct
+	FROM votes
+	WHERE Timestamp = timeIN
+	ORDER BY totalVotes DESC;
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 12 -
+Using the timestamp preceding the input (input is one of the timestamps), DELTA is the time 
+passed since that preceding timestamp. GAIN is the increase of votes since the preceding
+timestamp. Also, the query shows GAIN/DELTA.
+
+DELIMITER //
+CREATE PROCEDURE GainDelta(IN input VARCHAR(255))
+BEGIN
+IF(input = '2020-11-03 19:39:48')
+THEN
+SELECT 0 as 'DELTA', 0 as 'GAIN', 0 as 'GAIN/DELTA';
+END IF;
+IF(input <> '2020-11-03 19:39:48')
+THEN
+DROP TABLE if exists times;
+CREATE TABLE Times as (SELECT Timestamp, sum(totalvotes) as totalv
+	FROM votes
+	GROUP BY Timestamp);
+SELECT TIMESTAMPDIFF(second, t2.Timestamp, t1.Timestamp) as 'DELTA', 
+t1.totalV - t2.totalV as 'GAIN',
+(t1.totalV - t2.totalV)/TIMESTAMPDIFF(second, t2.Timestamp, t1.Timestamp) as 'GAIN/DELTA'
+FROM times t1, (SELECT Timestamp, totalV
+	FROM times
+	WHERE Timestamp = (SELECT max(Timestamp)
+		FROM(SELECT distinct Timestamp
+			FROM times
+			WHERE Timestamp < input)t))t2
+WHERE t1.Timestamp = input;
+END IF;
+END //
+DELIMITER ;
+
+
+ - Procedure 13 -
+Gives a numerical rank to each timestamp and this rank is in terms of GAIN/DELTA ratio (see
+Procedure 12).
+
+DELIMITER //
+CREATE PROCEDURE RankTimestamp()
+BEGIN
+DECLARE counter INT DEFAULT 0;
+DECLARE stop_count INT DEFAULT (SELECT COUNT(distinct Timestamp)
+	FROM votes);
+DECLARE timestamp_var VARCHAR(255);
+DROP TABLE if exists GainDelta_table;
+CREATE TABLE GainDelta_table(
+	Timestamp	VARCHAR(255),
+	GainDelta_Ratio	REAL);
+DROP TABLE if exists times;
+CREATE TABLE Times as (SELECT Timestamp, sum(totalvotes) as totalv
+	FROM votes
+	GROUP BY Timestamp);
+WHILE counter <= stop_count DO
+	SET timestamp_var = (SELECT Timestamp 
+		FROM times 
+		LIMIT counter, 1);
+	IF(timestamp_var = '2020-11-03 19:39:48')
+	THEN
+	INSERT INTO GainDelta_table(Timestamp, GainDelta_Ratio)
+	VALUES(timestamp_var, 0);
+	END IF;
+	IF(timestamp_var <> '2020-11-03 19:39:48')
+	THEN
+	INSERT INTO GainDelta_table(Timestamp, GainDelta_Ratio) 
+	SELECT t1.Timestamp, 
+	(t1.totalV - t2.totalV)/TIMESTAMPDIFF(second, t2.Timestamp, t1.Timestamp) as 'GAIN/DELTA'
+	FROM times t1, (SELECT Timestamp, totalV
+		FROM times
+		WHERE Timestamp = (SELECT max(Timestamp)
+			FROM(SELECT distinct Timestamp
+				FROM times
+				WHERE Timestamp < timestamp_var)t))t2
+	WHERE t1.Timestamp = timestamp_var;
+	END IF;
+	SET counter = counter + 1;
+END WHILE;
+SELECT Timestamp
+FROM gaindelta_table
+ORDER BY GainDelta_Ratio DESC;
+END//
+DELIMITER ;
+
+
+==============================================================================================
+==============================================================================================
+
+
+QUERIES FOR CHECKING IF THE DATA FOLLOWS VALID PATTERNS:
+--------------------------------------------------------
+
+ - Query 1 -
+Checks if the sum of Trump and Biden votes is always smaller than totalvotes.
+
+SELECT distinct 'True'  as 'Pattern enforced'
+FROM votes
+WHERE NOT EXISTS (SELECT Timestamp
+	FROM votes
+	WHERE totalvotes < Trump + Biden
+UNION
+SELECT distinct 'False'  as 'Pattern enforced'
+FROM votes
+WHERE EXISTS (SELECT Timestamp
+	FROM votes
+	WHERE totalvotes < Trump + Biden));
+
+Result:
+Pattern enforced
+------------------
+True
+
+
+ - Query 2 - 
+Checks if there are no tuples with a Timestamp before November 3 or after November 11.
+
+SELECT distinct 'True'  as 'Pattern enforced'
+FROM votes
+WHERE NOT EXISTS(SELECT Timestamp
+	FROM votes
+	WHERE Timestamp < '2020-11-03 00:00:00' or Timestamp > '2020-11-11 23:59:59')
+UNION
+SELECT distinct 'False' as 'Pattern enforced'
+FROM votes
+WHERE EXISTS (SELECT Timestamp
+	FROM votes
+	WHERE Timestamp < '2020-11-03 00:00:00' or Timestamp > '2020-11-11 23:59:59');
+
+Result:
+Pattern enforced
+------------------
+True
+
+
+ - Query 3 -
+Checks if totalvotes, Trump votes, and Biden votes for any precinct and at any timestamp after
+2020-11-05 00:00:00 is always smaller than the same attribute at the
+timestamp 2020-11-05 00:00:00 for that precinct.
+
+SELECT distinct 'True'  as 'Pattern enforced'
+FROM votes
+WHERE NOT EXISTS(SELECT v1.precinct
+	FROM votes v1, votes v2
+	WHERE v1.precinct = v2.precinct and v1.Timestamp = '2020-11-04 23:50:41' 
+		and v2.Timestamp >= '2020-11-05 00:00:00'
+		and (v1.totalvotes > v2.totalvotes or v1.Biden > v2.Biden 
+			or v1.Trump > v2.Trump))
+UNION
+SELECT distinct 'False' as 'Pattern enforced'
+FROM votes
+WHERE EXISTS(SELECT v1.precinct
+	FROM votes v1, votes v2
+	WHERE v1.precinct = v2.precinct and v1.Timestamp = '2020-11-04 23:50:41' 
+		and v2.Timestamp >= '2020-11-05 00:00:00'
+		and (v1.totalvotes > v2.totalvotes or v1.Biden > v2.Biden 
+			or v1.Trump > v2.Trump));
+
+Result:
+Pattern enforced
+------------------
+True
+
+
+==============================================================================================
+==============================================================================================
+
+
+PROCEDURES FOR MODIFYING TABLES:
+--------------------------------
+
+ - Procedure 1 -
+Updates an existing tuple (with values Timestamp_old and precinct_old) from a 
+table (table_name) with new values (ID_new, Timestamp_new, state_new, locality_new, 
+precinct_new, geo_new, totalvotes_new, Biden_new, Trump_new, filestamp_new). 
+
+DELIMITER //
+CREATE PROCEDURE update_table(IN ID_new REAL, IN Timestamp_new VARCHAR(255), 
+	IN state_new VARCHAR(255), IN locality_new VARCHAR(255), IN precinct_new VARCHAR(255), 
+	IN geo_new VARCHAR(255), IN totalvotes_new REAL, IN Biden_new REAL, IN Trump_new REAL, 
+	IN filestamp_new VARCHAR(255), IN Timestamp_old VARCHAR(255), 
+	IN precinct_old VARCHAR(255), IN table_name VARCHAR(255))
+BEGIN
+IF(table_name = 'penna')
+THEN
+IF(Trump_new + Biden_new > totalvotes_new
+	or (Timestamp_new < '2020-11-03 00:00:00' or Timestamp_new > '2020-11-11 23:59:59')
+	or (Timestamp_new > '2020-11-05 00:00:00' and EXISTS(SELECT Timestamp
+		FROM votes
+		WHERE precinct = precinct_new and Timestamp = '2020-11-04 23:50:41' 
+			and (totalvotes > totalvotes_new or Biden > Biden_new or 
+				Trump > Trump_new))))
+THEN
+SELECT 'Update rejected due to constraint violation' as 'Feedback Message';
+ELSE
+UPDATE penna
+SET ID = ID_new, Timestamp = Timestamp_new, state = state_new, locality = locality_new, 
+	precinct = precinct_new, geo = geo_new, totalvotes = totalvotes_new,
+	Biden = Biden_new, Trump = Trump_new, filestamp = filestamp_new
+WHERE Timestamp = Timestamp_old and precinct = precinct_old;
+SELECT 'Update accepted' as 'Feedback Message';
+END IF;
+END IF;
+IF(table_name = 'votes')
+THEN
+IF(precinct_new NOT IN(SELECT precinct FROM precincts)
+	or Trump_new + Biden_new > totalvotes_new
+	or (Timestamp_new < '2020-11-03 00:00:00' or Timestamp_new > '2020-11-11 23:59:59')
+	or (Timestamp_new > '2020-11-05 00:00:00' and EXISTS(SELECT Timestamp
+		FROM votes
+		WHERE precinct = precinct_new and Timestamp = '2020-11-04 23:50:41' 
+			and (totalvotes > totalvotes_new or Biden > Biden_new or 
+				Trump > Trump_new))))
+THEN
+SELECT 'Update rejected due to constraint violation' as 'Feedback Message';
+ELSE
+UPDATE votes
+SET ID = ID_new, Timestamp = Timestamp_new, precinct = precinct_new, 
+	totalvotes = totalvotes_new, Biden = Biden_new, Trump = Trump_new,
+	filestamp = filestamp_new
+WHERE Timestamp = Timestamp_old and precinct = precinct_old;
+SELECT 'Update accepted' as 'Feedback Message';
+END IF;
+END IF;
+IF(table_name = 'precincts')
+THEN
+UPDATE precincts
+SET precinct = precinct_new, state = state_new, locality = locality_new, geo = geo_new
+WHERE precinct = precinct_old;
+UPDATE votes
+SET precinct = precinct_new
+WHERE precinct = precinct_old;
+SELECT 'Update accepted' as 'Feedback Message';
+END IF;
+END//
+DELIMITER ;
+
+
+- Procedure 2 -
+Inserts a new tuple (with values of ID_new, Timestamp_new, state_new, locality_new,
+precinct_new, geo_new, totalvotes_new, Biden_new, Trump_new, filestamp_new) from a
+table (table_name).
+
+DELIMITER //
+CREATE PROCEDURE insert_table(IN ID_new REAL, IN Timestamp_new VARCHAR(255), 
+	IN state_new VARCHAR(255), IN locality_new VARCHAR(255), IN precinct_new VARCHAR(255), 
+	IN geo_new VARCHAR(255), IN totalvotes_new REAL, IN Biden_new REAL, IN Trump_new REAL, 
+	IN filestamp_new VARCHAR(255), IN table_name VARCHAR(255))
+BEGIN
+IF(table_name = 'penna')
+THEN
+IF(Trump_new + Biden_new > totalvotes_new
+	or (Timestamp_new < '2020-11-03 00:00:00' or Timestamp_new > '2020-11-11 23:59:59')
+	or (Timestamp_new > '2020-11-05 00:00:00' and EXISTS(SELECT Timestamp
+		FROM votes
+		WHERE precinct = precinct_new and Timestamp = '2020-11-04 23:50:41' 
+			and (totalvotes > totalvotes_new or Biden > Biden_new or 
+				Trump > Trump_new))))
+THEN
+SELECT 'Insert rejected due to constraint violation' as 'Feedback Message';
+ELSE
+INSERT INTO penna(ID, Timestamp, state, locality, precinct, geo, totalvotes, Biden, Trump, 
+	filestamp)
+VALUES (ID_new, Timestamp_new, state_new, locality_new, precinct_new, geo_new, totalvotes_new, 
+	Biden_new, Trump_new, filestamp_new);
+SELECT 'Insert accepted' as 'Feedback Message';
+END IF;
+END IF;
+IF(table_name = 'votes')
+THEN
+IF(precinct_new NOT IN (SELECT precinct FROM precincts)
+	or Trump_new + Biden_new > totalvotes_new
+	or (Timestamp_new < '2020-11-03 00:00:00' or Timestamp_new > '2020-11-11 23:59:59')
+	or (Timestamp_new > '2020-11-05 00:00:00' and EXISTS(SELECT Timestamp
+		FROM votes
+		WHERE precinct = precinct_new and Timestamp = '2020-11-04 23:50:41' 
+			and (totalvotes > totalvotes_new or Biden > Biden_new or 
+				Trump > Trump_new))))
+THEN
+SELECT 'Insert rejected due to constraint violation' as 'Feedback Message';
+ELSE
+INSERT INTO votes(ID, Timestamp, precinct, totalvotes, Biden, Trump, filestamp)
+VALUES (ID_new, Timestamp_new, precinct_new, totalvotes_new, Biden_new, Trump_new, filestamp_new);
+SELECT 'Insert accepted' as 'Feedback Message';
+END IF;
+END IF;
+IF(table_name = 'precincts')
+THEN
+INSERT INTO precincts(precinct, state, locality, geo)
+VALUES(precinct_new, state_new, locality_new, geo_new);
+SELECT 'Insert accepted' as 'Feedback Message';
+END IF;
+END//
+DELIMITER ;
+
+
+ - Procedure 3 -
+Deletes an existing tuple (with values ID_del, Timestamp_del, state_del, locality_del,
+precinct_del, geo_del, totalvotes_del, Biden_del, Trump_del, filestamp_del) from
+table (table_name)
+
+DELIMITER //
+CREATE PROCEDURE delete_table(IN ID_del REAL, IN Timestamp_del VARCHAR(255), 
+	IN state_del VARCHAR(255), IN locality_del VARCHAR(255), IN precinct_del VARCHAR(255), 
+	IN geo_del VARCHAR(255), IN totalvotes_del REAL, IN Biden_del REAL, IN Trump_del REAL, 
+	IN filestamp_del VARCHAR(255), IN table_name VARCHAR(255))
+BEGIN
+IF(table_name = 'penna')
+THEN
+DELETE FROM penna
+WHERE Timestamp = Timestamp_del and precinct = precinct_del;
+END IF;
+IF(table_name = 'votes')
+THEN
+DELETE FROM votes
+WHERE Timestamp = Timestamp_del and precinct = precinct_del;
+END IF;
+IF(table_name = 'precincts')
+THEN
+DELETE FROM precincts
+WHERE precinct = precinct_del;
+DELETE FROM votes
+WHERE precinct = precinct_del;
+END IF;
+SELECT 'Delete accepted' as 'Feedback Message';
+END//
+DELIMITER ;
+
+
+==============================================================================================
+==============================================================================================
+
+TRIGGERS AND TRIGGER TABLES:
+----------------------------
+
+ - Trigger 1 -
+When a tuple in Penna is updated, the original tuple is inserted into Updated_Tuples.
+
+CREATE TABLE Updated_Tuples(
+	ID	REAL,
+	Timestamp	VARCHAR(255),
+	state	VARCHAR(255),
+	locality	VARCHAR(255),
+	precinct	VARCHAR(255),
+	geo	VARCHAR(255),
+	totalvotes	REAL,
+	Biden	REAL,
+	Trump	REAL,
+	filestamp	VARCHAR(255));
+
+DELIMITER //
+CREATE TRIGGER updated_trigger
+AFTER UPDATE ON penna
+FOR EACH ROW
+BEGIN
+INSERT INTO updated_tuples
+VALUES(OLD.ID, OLD.Timestamp, OLD.state, OLD.locality, OLD.precinct, OLD.geo, OLD.totalvotes, 
+	OLD.Biden, OLD.Trump, OLD.filestamp);
+END//
+DELIMITER ;
+
+
+ - Trigger 2 - 
+When a tuple is inserted into Penna, that tuple is also inserted into Inserted_Tuples.
+
+CREATE TABLE Inserted_Tuples(
+	ID	REAL,
+	Timestamp	VARCHAR(255),
+	state	VARCHAR(255),
+	locality	VARCHAR(255),
+	precinct	VARCHAR(255),
+	geo	VARCHAR(255),
+	totalvotes	REAL,
+	Biden	REAL,
+	Trump	REAL,
+	filestamp	VARCHAR(255));
+
+DELIMITER //
+CREATE TRIGGER inserted_trigger
+AFTER INSERT ON penna
+FOR EACH ROW
+BEGIN
+INSERT INTO inserted_tuples
+VALUES(NEW.ID, NEW.Timestamp, NEW.state, NEW.locality, NEW.precinct, NEW.geo, NEW.totalvotes, 
+	NEW.Biden, NEW.Trump, NEW.filestamp);
+END//
+DELIMITER ;
+
+
+ - Trigger 3 -
+When a tuple is deleted from Penna, that tuple is inserted into Deleted_Tuples
+
+CREATE TABLE Deleted_Tuples(
+	ID	REAL,
+	Timestamp	VARCHAR(255),
+	state	VARCHAR(255),
+	locality	VARCHAR(255),
+	precinct	VARCHAR(255),
+	geo	VARCHAR(255),
+	totalvotes	REAL,
+	Biden	REAL,
+	Trump	REAL,
+	filestamp	VARCHAR(255));
+
+DELIMITER //
+CREATE TRIGGER deleted_trigger
+AFTER DELETE ON penna
+FOR EACH ROW
+BEGIN
+INSERT INTO deleted_tuples
+VALUES(OLD.ID, OLD.Timestamp, OLD.state, OLD.locality, OLD.precinct, OLD.geo, OLD.totalvotes, 
+	OLD.Biden, OLD.Trump, OLD.filestamp);
+END//
+DELIMITER ;
